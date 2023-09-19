@@ -1,3 +1,7 @@
+
+//g++ -DBOOST_ASIO_ENABLE_HANDLER_TRACKING readfile3.cpp -lz -lcrypto -lssl -lboost_iostreams
+
+
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
