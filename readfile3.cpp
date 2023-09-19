@@ -1,7 +1,3 @@
-
-//g++ -DBOOST_ASIO_ENABLE_HANDLER_TRACKING readfile3.cpp -lz -lcrypto -lssl -lboost_iostreams
-
-
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
@@ -107,10 +103,10 @@ struct Stream
     
     bool consume_line()
     {
-        std::cout << "consume line " <<  nl_pos_ << " " << out_buffer.size() << std::endl;
+        //std::cout << "consume line " <<  nl_pos_ << " " << out_buffer.size() << std::endl;
         out_buffer.consume(nl_pos_+1);	// +1 to consume the new line also
         nl_pos_ = 0;
-        std::cout << "consume line outbuffer.size after consume=" << out_buffer.size() << std::endl;
+        //std::cout << "consume line outbuffer.size after consume=" << out_buffer.size() << std::endl;
         if (out_buffer.size() == 0)
         {
             std::cout << "BUF SIZE IS ZERO read more data" << std::endl;
@@ -118,6 +114,7 @@ struct Stream
             start_read_data();
             return false;
         }
+        // see if we have another line in the buffer ready to read
         uint8_t * buf_start = (uint8_t*)net::buffer_sequence_begin(out_buffer.data())->data();        
         nl_pos_ = find_new_line(0,buf_start,buf_start+out_buffer.size());
         if (nl_pos_ == 0)
@@ -142,62 +139,80 @@ struct Stream
             return 0;
     }
 
-    std::array<uint8_t,1024>  buf_;
+    //std::array<uint8_t,1024> buf_;
+    
+    beast::flat_buffer buf_;
     
     void start_read_data()
     {
-        std::cout << "Calling readsome " << read_buffer.size() << " " << read_buffer.capacity() << std::endl;
-
-        response_reader.get().body().data = buf_.data();
-        response_reader.get().body().size = buf_.size();
+        std::cout << "Calling http::async_read " << this << " " << buf_.size() << std::endl;
+        
+        constexpr size_t readsize = 1024;
+        auto b = buf_.prepare(readsize);
+        
+        std::cout << b.data() << " " << b.size() << std::endl;
+        
+        response_reader.get().body().data = b.data();
+        response_reader.get().body().size = b.size();
 
         http::async_read(socket, read_buffer, response_reader, [this](error_code ec, size_t bytes_transferred) 
                 {
                     size_t bsz = response_reader.get().body().size;
+                    
+                    buf_.commit(bytes_transferred);
+                    
                     size_t rsz = buf_.size() - bsz;
 
                     std::cout << "async_read returned is_done=" << response_reader.is_done() << "bytes_transferred=" << bytes_transferred << " " << ec.message() << " bsz=" << bsz << " rsz=" << rsz  << std::endl;
-                    uint8_t * in_start = (uint8_t*)buf_.data();
-                    zstr.next_in = in_start;
-                    size_t in_size = rsz; //net::buffer_sequence_begin(read_buffer.data())->size();
-                    zstr.avail_in = in_size;
-                    size_t out_size = buf_.size() * 3;
-                    uint8_t * out_start = (uint8_t*)out_buffer.prepare(out_size).data();
-                    zstr.next_out = out_start;
-                    zstr.avail_out = out_size;
-                    int err = 0;
-                    printf("IN in=%p ins=%d out=%p outs=%d\n",zstr.next_in,zstr.avail_in,zstr.next_out,zstr.avail_out);
-                    err = inflate(&zstr,Z_SYNC_FLUSH);
-                    printf("OUT in=%p ins=%d out=%p outs=%d\n",zstr.next_in,zstr.avail_in,zstr.next_out,zstr.avail_out);
-                    std::cout << "inflate ret=" << err << " " << std::endl;
-                    if ( err != 0)
+
+                    int err = Z_OK;
+
+                    do
                     {
-                        std::cout << "INFLATE ERRROR" << std::endl;
-                        return;
+                        auto b = net::buffer_sequence_begin(buf_.data());
+                        zstr.next_in = (uint8_t*)b->data();
+                        size_t in_size = b->size();
+                        zstr.avail_in = in_size;
+                        size_t out_size = 1024;
+                        uint8_t * out_start = (uint8_t*)out_buffer.prepare(out_size).data();
+                        zstr.next_out = out_start;
+                        zstr.avail_out = out_size;
+                        int err = 0;
+                        printf("IN next_in=%p avail_in=%d next_out=%p avail_out=%d\n",zstr.next_in,zstr.avail_in,zstr.next_out,zstr.avail_out);
+                        err = inflate(&zstr,Z_SYNC_FLUSH);
+                        printf("OUT next_in=%p avail_in=%d next_out=%p avail_out=%d\n",zstr.next_in,zstr.avail_in,zstr.next_out,zstr.avail_out);
+                        std::cout << "inflate ok=" << (err==Z_OK) << " err=" << err << std::endl;
+                        if ( err ==  Z_STREAM_END )
+                        {
+                            std::cout << "STREAM END OK " << std::endl;
+                        }
+                        else if (err != Z_OK)
+                        {	
+                            std::cout << "STREAM ERR" << std::endl;
+                            return;
+                        }
+                        size_t out_bytes = out_size - zstr.avail_out;
+                        buf_.consume(in_size - zstr.avail_in);
+                        out_buffer.commit(out_bytes); // after call to commit all buffers prepared can become invalid, search for NL in this chunk before commiting
+                    } while(err == Z_OK && zstr.avail_out == 0 && zstr.avail_in > 0);
+                    
+                    size_t tots = 0;
+                    for(auto ii = net::buffer_sequence_begin(out_buffer.data());ii!= net::buffer_sequence_end(out_buffer.data());ii++)
+                    {
+                        auto out_start = (uint8_t*)ii->data();
+                        auto out_end = out_start + ii->size();
+                        nl_pos_ = find_new_line(tots,out_start,out_end);
+                        if (nl_pos_)
+                            break;
+                        tots+=ii->size();
                     }
 
-                    size_t out_bytes = out_size - zstr.avail_out;
-
-                    if (out_bytes == 0)
-                    {
-                        std::cout << "DIDNT MANAGED TO UNCOMPRESSS ANY - KICK OFF READ MORE " << std::endl;
-                        out_buffer.commit(out_bytes);
-                        start_read_data();
-                        return;
-                    }
-
-                    auto out_end = out_start+out_bytes;
-                    nl_pos_ = find_new_line(out_buffer.size(),out_start,out_end);                    
-
-                    out_buffer.commit(out_bytes); // after call to commit all buffers prepared can become invalid, search for NL in this chunk before commiting
-                    if (nl_pos_ == 0)
+                    //if (nl_pos_ == 0)
+                    if (!response_reader.is_done() && nl_pos_ == 0)
                     {
                         // if we didnt find a new line then read more data
                         start_read_data();
                     }
-
-                    std::cout << "NOT SPAWNING NEW READ YET " << std::endl;
-
                 } );
     }
 };
@@ -226,20 +241,25 @@ int main(int argc, char ** argv)
 
   for(;;)
   {
-    std::cout << "CALLING IO RUN" << std::endl;
+    //std::cout << "CALLING IO RUN" << std::endl;
     io.run();
-    std::cout << "IO RUN RETURN" << std::endl;
-    std::string_view v;
-    for(auto & s : streams)
-    {
-        if (s->getline(v))
+    //std::cout << "IO RUN RETURN" << std::endl;
+    bool need_io_run = false;
+    do {
+        for(auto & s : streams)
         {
-            std::cout << "LINE= " << v.size() << " " << std::string_view(v.data(),std::min(v.size(),size_t(50))) << std::endl;
-            if (!s->consume_line())
+            std::string_view v;
+            if (s->getline(v))
             {
-                break;
+                std::cout << "LINE= " << v.size() << " " << std::string_view(v.data(),std::min(v.size(),size_t(50))) << std::endl;
+                if (!s->consume_line())
+                {
+                    // consume line returns false if it kicked off async_read
+                    // so now run completion handlers
+                    need_io_run = true;
+                }
             }
         }
-    }
+    } while(!need_io_run);
   }
 }
